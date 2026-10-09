@@ -1,0 +1,1 @@
+timestamp,elapsed_s,phase,faces,face_x,face_y,face_w,face_h,face_area,filtered_area,lr,fb,ud,yaw,depth_left,depth_center,depth_right

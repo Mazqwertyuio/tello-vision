@@ -4,21 +4,13 @@ __pycache__/
 *$py.class
 .pytest_cache/
 
-# Large model weights (do not push binaries >25MB to GitHub)
-*.onnx
-*.pt
+# Large files over 100MB (GitHub blocks files > 100MB)
+weights/
 *.pth
 *.safetensors
 *.bin
-weights/
 
-# Video recordings & telemetry debug dumps (large gigabyte files)
-debug/
-*.mp4
-*.avi
-*.mov
-
-# Local scratch / test files
+# Local scratch & temporary test images
 scratch/
 test_*.jpg
 door_verify_grid.jpg
