@@ -1,0 +1,30 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Large model weights (do not push binaries >25MB to GitHub)
+*.onnx
+*.pt
+*.pth
+*.safetensors
+*.bin
+weights/
+
+# Video recordings & telemetry debug dumps (large gigabyte files)
+debug/
+*.mp4
+*.avi
+*.mov
+
+# Local scratch / test files
+scratch/
+test_*.jpg
+door_verify_grid.jpg
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
