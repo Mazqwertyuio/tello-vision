@@ -15,6 +15,13 @@ scratch/
 test_*.jpg
 door_verify_grid.jpg
 
+# Generated output videos & reconstructions
+debug/*/*_reconstruction.mp4
+debug/*/*_output.mp4
+debug/*/*_eval.mp4
+debug/*/*_summary.json
+debug/*/*_trajectory.csv
+
 # IDE & OS
 .vscode/
 .idea/

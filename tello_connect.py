@@ -402,6 +402,7 @@ def main():
     latest_corridor_info = None
     current_tof = 35
     last_tof_at = 0.0
+    current_tello_state = {}
     last_depth_at = 0.0
     latest_depth_map = None
     latest_depth_colormap = None
@@ -417,7 +418,8 @@ def main():
     command_log.writerow(("frame_idx", "timestamp", "elapsed_s", "state", "phase", "faces_count",
                           "face_x", "face_y", "face_w", "face_h", "face_conf", "lr", "fb", "ud", "yaw", "battery",
                           "depth_left", "depth_center", "depth_right", "depth_center_max", "depth_ms",
-                          "door_status", "door_phase", "door_passable", "door_cx", "door_cy", "door_step"))
+                          "door_status", "door_phase", "door_passable", "door_cx", "door_cy", "door_step",
+                          "imu_pitch", "imu_roll", "imu_yaw", "speed_vx", "speed_vy", "speed_vz", "tof_cm", "baro_cm"))
     legacy_log_file = (debug_dir / "commands.csv").open("w", newline="", encoding="utf-8")
     legacy_log = csv.writer(legacy_log_file)
     legacy_log.writerow(("timestamp", "elapsed_s", "phase", "faces", "face_x", "face_y",
@@ -523,12 +525,17 @@ def main():
                     pass
                 last_depth_at = now
 
-            # Query ToF ground distance for low-altitude corridor hold (~30-35cm)
-            if now - last_tof_at >= 0.10:
+            # Query Tello onboard state sensors (IMU Gyro, ToF, Optical Flow velocities)
+            if now - last_tof_at >= 0.05:
                 try:
-                    tof_val = drone.get_distance_tof()
+                    current_tello_state = drone.get_current_state() or {}
+                    tof_val = current_tello_state.get("tof")
                     if tof_val and 5 < tof_val < 300:
                         current_tof = tof_val
+                    elif not tof_val:
+                        tof_val = drone.get_distance_tof()
+                        if tof_val and 5 < tof_val < 300:
+                            current_tof = tof_val
                 except Exception:
                     pass
                 last_tof_at = now
@@ -773,7 +780,9 @@ def main():
                             best_scan_depth = 999.0
                             rc_command = (0, 0, 0, 0)
                         else:
-                            rc_command = (lateral, forward, 0, 0)
+                            # Dynamic yaw steering toward the deepest open room space
+                            yaw_steer = int(clamp((d_l - d_r) * 0.25, -20, 20))
+                            rc_command = (lateral, forward, 0, yaw_steer)
                             if now - explore_started_at >= EXPLORE_BURST_TIME:
                                 print("\n[DOOR NAV] Reached new vantage point in room. Beginning new 360 scan.")
                                 door_phase = "SCAN_ROOM"
@@ -1002,6 +1011,14 @@ def main():
                 door_cx,
                 door_cy,
                 door_st_diff,
+                current_tello_state.get("pitch", 0),
+                current_tello_state.get("roll", 0),
+                current_tello_state.get("yaw", 0),
+                current_tello_state.get("vgx", 0),
+                current_tello_state.get("vgy", 0),
+                current_tello_state.get("vgz", 0),
+                current_tello_state.get("tof", current_tof or 0),
+                round(float(current_tello_state.get("baro", 0.0) or 0.0), 1),
             ))
             command_log_file.flush()
 

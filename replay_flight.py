@@ -19,6 +19,12 @@ from door_navigator import (
     analyze_forward_corridor, draw_corridor_hud
 )
 
+try:
+    from da2_depth import DA2DepthEstimator
+    HAS_DA2 = True
+except ImportError:
+    HAS_DA2 = False
+
 
 class MonoDepthEstimator:
     """Lightweight Monocular Depth Estimation on CUDA/CPU (supports 96x96 and 128x96)
@@ -364,6 +370,7 @@ def main():
     print("  C           - Toggle Color Inversion (R/B Swap) for legacy videos")
     print("  1           - Switch Depth resolution to 96x96 (ultra-fast)")
     print("  2           - Switch Depth resolution to 128x96 (4:3 aspect)")
+    print("  3           - Switch Depth model to Depth Anything V2 (DA2)")
     print("  LEFT ARROW  - Step 1 frame backward")
     print("  RIGHT ARROW - Step 1 frame forward")
     print("  R           - Rewind to beginning")
@@ -385,8 +392,14 @@ def main():
 
     is_paused = False
     depth_enabled = True  # Enable depth estimation by default for testing!
-    depth_res = (128, 96)
-    depth_estimator = MonoDepthEstimator(input_size=depth_res)
+    use_da2 = "--da2" in sys.argv
+    if use_da2 and HAS_DA2:
+        print("Initializing with Depth Anything V2 (DA2)...")
+        depth_res = (252, 252)
+        depth_estimator = DA2DepthEstimator(input_size=252)
+    else:
+        depth_res = (128, 96)
+        depth_estimator = MonoDepthEstimator(input_size=depth_res)
     current_frame_idx = 0
     swap_rb = False  # Toggle with 'C' to fix color inversion in legacy recordings
     door_detector = DoorwayDetector(depth_estimator=depth_estimator, use_yolo=True)
@@ -492,12 +505,30 @@ def main():
             print(f"Depth map display: {'ENABLED' if depth_enabled else 'DISABLED'}")
         elif key == ord("1"):
             depth_res = (96, 96)
-            if depth_estimator:
+            if isinstance(depth_estimator, MonoDepthEstimator):
                 depth_estimator.set_resolution(96, 96)
+            else:
+                depth_estimator = MonoDepthEstimator(input_size=depth_res)
+                if door_detector:
+                    door_detector.depth_estimator = depth_estimator
         elif key == ord("2"):
             depth_res = (128, 96)
-            if depth_estimator:
+            if isinstance(depth_estimator, MonoDepthEstimator):
                 depth_estimator.set_resolution(128, 96)
+            else:
+                depth_estimator = MonoDepthEstimator(input_size=depth_res)
+                if door_detector:
+                    door_detector.depth_estimator = depth_estimator
+        elif key == ord("3"):
+            if HAS_DA2:
+                print("Switching depth engine to Depth Anything V2 (DA2)...")
+                depth_estimator = DA2DepthEstimator(input_size=252)
+                depth_res = (252, 252)
+                if door_detector:
+                    door_detector.depth_estimator = depth_estimator
+                print("Active Depth Engine: Depth Anything V2 (DA2)")
+            else:
+                print("DA2 Depth Estimator not available.")
         elif key in (2424832, 65361, ord("a")):
             is_paused = True
             current_frame_idx = max(0, current_frame_idx - 1)
