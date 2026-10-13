@@ -1,34 +1,24 @@
-"""Autonomous Collision Prevention Shield.
+"""Collision Prevention Shield for Depth Map Autopilot.
 
-Monitors proposed RC commands against real-time LiDAR clearance:
-- Prevents collisions with walls, furniture, and persons in front.
-- Clamps forward velocity under CAUTION.
-- Imposes EMERGENCY BRAKE / REVERSE when distance drops below safety buffer.
-- Performs equidistant centering between lateral obstacles.
+Ensures the drone never flies forward into walls, barriers, or objects.
+Backward movement is strictly prohibited in autonomous modes (rear is blind).
 """
 
 from typing import Tuple, Dict, Any, Optional
 
-from config import (
-    LIDAR_BRAKE_DIST_M,
-    LIDAR_CAUTION_DIST_M,
-)
-
-
-def clamp(val: float, low: float, high: float) -> float:
-    return max(low, min(high, val))
+from config import DEPTH_OBSTACLE_THRESH, DEPTH_CRITICAL_BRAKE
 
 
 class CollisionShield:
-    """Interceps and filters drone RC commands through LiDAR safety field."""
+    """Filters flight commands against depth map obstacle proximity."""
 
     def __init__(
         self,
-        brake_dist_m: float = LIDAR_BRAKE_DIST_M,
-        caution_dist_m: float = LIDAR_CAUTION_DIST_M,
+        obstacle_thresh: float = DEPTH_OBSTACLE_THRESH,
+        brake_thresh: float = DEPTH_CRITICAL_BRAKE,
     ):
-        self.brake_dist_m = brake_dist_m
-        self.caution_dist_m = caution_dist_m
+        self.obstacle_thresh = obstacle_thresh
+        self.brake_thresh = brake_thresh
 
     def filter_command(
         self,
@@ -38,69 +28,25 @@ class CollisionShield:
         flank_right_m: float = 4.0,
         allow_reverse: bool = False,
     ) -> Tuple[Tuple[int, int, int, int], str]:
-        """Filter (lr, fb, ud, yaw) through safety envelope.
-
-        Returns:
-            safe_cmd: (lr, fb, ud, yaw)
-            shield_state: 'SAFE', 'CAUTION_SLOWDOWN', 'EMERGENCY_STOP', or 'COLLISION_AVOID'
-        """
+        """Verify command against depth map danger levels."""
         lr, fb, ud, yaw = raw_cmd
 
         if scan_res is None:
-            return raw_cmd, "NO_LIDAR_DATA"
+            return raw_cmd, "NO_DEPTH_DATA"
 
-        c_min = scan_res["sectors"]["center"]["min_m"]
-        l_min = scan_res["sectors"]["left"]["min_m"]
-        r_min = scan_res["sectors"]["right"]["min_m"]
-        closest_m = scan_res["closest"]["dist_m"]
+        danger_c = scan_res.get("danger_c", 0.0)
+        is_clear = scan_res.get("is_path_clear", True)
 
-        d_left = min(l_min, flank_left_m)
-        d_right = min(r_min, flank_right_m)
-
-        # 1. EMERGENCY BRAKE: obstacle dead-ahead
-        if c_min < self.brake_dist_m or closest_m < 0.65:
-            # Block forward flight completely (no blind reverse, rear is blind!)
+        # 1. EMERGENCY STOP (Point-blank obstacle ahead)
+        if danger_c >= self.brake_thresh:
             safe_fb = 0 if fb > 0 else (fb if allow_reverse else 0)
+            return (0, int(safe_fb), int(ud), int(yaw)), "EMERGENCY_BRAKE"
 
-            # Suppress lateral twitching when rotating in place
-            safe_lr = lr
-            if abs(yaw) < 5 and fb > 0:
-                if d_left < 0.70:
-                    safe_lr = 10
-                elif d_right < 0.70:
-                    safe_lr = -10
-            else:
-                # In-place turn: keep lateral strictly stable (0)
-                safe_lr = 0
+        # 2. CAUTION (Obstacle blocking forward path)
+        if not is_clear or danger_c >= self.obstacle_thresh:
+            safe_fb = 0 if fb > 0 else (fb if allow_reverse else 0)
+            return (0, int(safe_fb), int(ud), int(yaw)), "CAUTION"
 
-            return (int(safe_lr), int(safe_fb), int(ud), int(yaw)), "EMERGENCY_BRAKE"
-
-        # 2. CAUTION: obstacle approaching
-        if c_min < self.caution_dist_m or closest_m < self.brake_dist_m:
-            safe_fb = min(fb, 10) if fb > 0 else fb
-
-            safe_lr = lr
-            # Only apply centering when actively flying straight forward
-            if abs(yaw) < 5 and fb > 0:
-                if d_left < 1.6 and d_right < 1.6:
-                    diff = d_right - d_left  # positive -> left is closer
-                    if abs(diff) > 0.10:
-                        safe_lr = int(clamp(diff * 14.0, -12, 12))
-                elif d_left < 0.85:
-                    safe_lr = 10
-                elif d_right < 0.85:
-                    safe_lr = -10
-            else:
-                # During rotation / hover, eliminate lateral twitching
-                safe_lr = 0
-
-            return (int(safe_lr), int(safe_fb), int(ud), int(yaw)), "CAUTION"
-
-        # 3. SAFE
-        safe_lr = lr
-        if abs(yaw) < 5 and fb > 0 and d_left < 1.5 and d_right < 1.5:
-            diff = d_right - d_left
-            if abs(diff) > 0.12:
-                safe_lr = int(clamp(safe_lr + diff * 8.0, -10, 10))
-
-        return (int(safe_lr), int(fb), int(ud), int(yaw)), "SAFE"
+        # 3. CLEAR PATH
+        safe_fb = fb if (fb > 0 or allow_reverse) else 0
+        return (int(lr), int(safe_fb), int(ud), int(yaw)), "SAFE"

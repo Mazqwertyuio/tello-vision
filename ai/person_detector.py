@@ -1,145 +1,131 @@
-"""Human Face & Person Detection Neural Module for Target Following.
+"""Person Silhouette Detector using YOLOv8n (with OpenCV HOG Fallback).
 
-Combines high-accuracy OpenCV YuNet DNN with Haar Cascades fallback.
-Includes target selection with spatial hysteresis to avoid flickering between targets.
+Detects full-body and upper-body human silhouettes in real-time on GPU.
 """
 
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional
 import cv2
 import numpy as np
 
-from config import YUNET_MODEL, FACE_DETECTION_SCALE, FACE_CONFIDENCE_THRESH, get_safe_path
+from config import YOLO_MODEL_PATH
+
+try:
+    from ultralytics import YOLO
+    import torch
+    HAS_YOLO = True
+except ImportError:
+    HAS_YOLO = False
 
 
 class PersonDetector:
-    """Robust face and person detector for drone tracking."""
+    """Detects human silhouettes for drone tracking."""
 
     def __init__(self, model_path: Optional[Path] = None):
-        self.yunet = None
-        self.haars = []
-        self.name = "Haar Cascade"
-        self.target_face = None
+        self.yolo = None
+        self.hog = None
+        self.name = "None"
+        self.target_person = None
 
-        target_model = model_path or YUNET_MODEL
-        if target_model.exists() and hasattr(cv2, "FaceDetectorYN"):
+        m_path = model_path or YOLO_MODEL_PATH
+        if HAS_YOLO and m_path.exists():
             try:
-                safe_model_str = get_safe_path(target_model)
-                self.yunet = cv2.FaceDetectorYN.create(
-                    model=safe_model_str,
-                    config="",
-                    input_size=(320, 240),
-                    score_threshold=FACE_CONFIDENCE_THRESH,
-                    nms_threshold=0.3,
-                    top_k=5000,
-                    backend_id=cv2.dnn.DNN_BACKEND_OPENCV,
-                    target_id=cv2.dnn.DNN_TARGET_CPU,
-                )
-                self.name = "OpenCV YuNet (DNN)"
-                print(f"[AI DETECTOR] Initialized YuNet detector from: {safe_model_str}")
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                print(f"[AI PERSON] Loading YOLOv8n silhouette detector on {device}...")
+                self.yolo = YOLO(str(m_path.resolve()))
+                self.name = f"YOLOv8n ({device})"
+                print(f"[AI PERSON] YOLOv8n ready.")
             except Exception as exc:
-                print(f"[AI DETECTOR WARNING] Failed to load YuNet: {exc}. Falling back to Haar.")
-                self.yunet = None
+                print(f"[AI PERSON WARNING] Failed to initialize YOLO: {exc}")
+                self.yolo = None
 
-        if self.yunet is None:
-            self._load_haar_cascades()
-
-    def _load_haar_cascades(self):
-        """Load Haar cascades from cv2 data."""
-        try:
-            p_default = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
-            c1 = cv2.CascadeClassifier(str(p_default))
-            if not c1.empty():
-                self.haars.append(c1)
-            p_alt = Path(cv2.data.haarcascades) / "haarcascade_frontalface_alt2.xml"
-            if p_alt.exists():
-                c2 = cv2.CascadeClassifier(str(p_alt))
-                if not c2.empty():
-                    self.haars.append(c2)
-            print("[AI DETECTOR] Haar Cascades loaded.")
-        except Exception as exc:
-            print(f"[AI DETECTOR WARNING] Could not load Haar cascades: {exc}")
+        if self.yolo is None:
+            # Fallback to OpenCV HOG People Detector
+            print("[AI PERSON] Using OpenCV HOG People Detector fallback.")
+            self.hog = cv2.HOGDescriptor()
+            self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+            self.name = "OpenCV HOG People Detector"
 
     def detect(self, frame_bgr: np.ndarray) -> List[Tuple[int, int, int, int, float]]:
-        """Detect faces in BGR frame.
+        """Detect human silhouettes in BGR frame.
 
         Returns:
-            List of (x, y, w, h, confidence) tuples in original frame coordinates.
+            List of (x, y, w, h, confidence) tuples.
         """
         h, w = frame_bgr.shape[:2]
-        if self.yunet is not None:
-            # Downscale frame for fast inference
-            scale = FACE_DETECTION_SCALE
-            dw = max(16, int(w * scale))
-            dh = max(16, int(h * scale))
-            small = cv2.resize(frame_bgr, (dw, dh), interpolation=cv2.INTER_LINEAR)
 
-            self.yunet.setInputSize((dw, dh))
-            _, faces = self.yunet.detect(small)
-
-            if faces is None or len(faces) == 0:
-                return []
-
-            results = []
-            inv_scale = 1.0 / scale
-            for f in faces:
-                x = int(f[0] * inv_scale)
-                y = int(f[1] * inv_scale)
-                bw = int(f[2] * inv_scale)
-                bh = int(f[3] * inv_scale)
-                conf = float(f[14])
-                # Bounds check
-                x = max(0, min(w - 1, x))
-                y = max(0, min(h - 1, y))
-                bw = max(1, min(w - x, bw))
-                bh = max(1, min(h - y, bh))
-                results.append((x, y, bw, bh, conf))
-            return results
-
-        # Fallback to Haar Cascade
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        for cascade in self.haars:
-            rects = cascade.detectMultiScale(
-                gray, scaleFactor=1.2, minNeighbors=4, minSize=(30, 30)
+        if self.yolo is not None:
+            # Run inference for class 0 (person)
+            results = self.yolo(
+                frame_bgr, classes=[0], conf=0.35, imgsz=320, verbose=False
             )
-            if len(rects) > 0:
-                return [(int(x), int(y), int(bw), int(bh), 0.85) for (x, y, bw, bh) in rects]
+            persons = []
+            if len(results) > 0 and results[0].boxes is not None:
+                for box in results[0].boxes:
+                    xyxy = box.xyxy[0].cpu().numpy()
+                    conf = float(box.conf[0].cpu().numpy())
+                    x1, y1, x2, y2 = xyxy
+                    bx = int(max(0, x1))
+                    by = int(max(0, y1))
+                    bw = int(min(w - bx, x2 - x1))
+                    bh = int(min(h - by, y2 - y1))
+                    if bw > 20 and bh > 30:
+                        persons.append((bx, by, bw, bh, conf))
+            return persons
+
+        # HOG fallback
+        if self.hog is not None:
+            small = cv2.resize(frame_bgr, (320, 240))
+            sx = w / 320.0
+            sy = h / 240.0
+            boxes, weights = self.hog.detectMultiScale(
+                small, winStride=(8, 8), padding=(4, 4), scale=1.05
+            )
+            persons = []
+            for (bx, by, bw, bh), weight in zip(boxes, weights):
+                if float(weight) > 0.2:
+                    persons.append((
+                        int(bx * sx), int(by * sy),
+                        int(bw * sx), int(bh * sy),
+                        float(weight)
+                    ))
+            return persons
 
         return []
 
     def select_target(
         self,
-        faces: List[Tuple[int, int, int, int, float]],
+        persons: List[Tuple[int, int, int, int, float]],
         frame_shape: Tuple[int, int],
         last_target: Optional[Tuple[int, int, int, int, float]] = None,
     ) -> Optional[Tuple[int, int, int, int, float]]:
-        """Select best candidate face with spatial hysteresis."""
-        if not faces:
+        """Select best candidate silhouette with center/size priority and hysteresis."""
+        if not persons:
             return None
 
         h, w = frame_shape[:2]
         center_x = w / 2.0
         center_y = h / 2.0
 
-        def score(face):
-            fx, fy, fw, fh = face[:4]
-            fc_x = fx + fw / 2.0
-            fc_y = fy + fh / 2.0
-            # Center offset penalty (normalized)
-            dist_to_center = np.hypot(fc_x - center_x, fc_y - center_y) / (w * 0.5)
-            # Area score (larger face = closer = higher priority)
-            area_ratio = (fw * fh) / float(w * h)
-            base_score = area_ratio * 2.0 - dist_to_center * 0.5
+        def score(p):
+            px, py, pw, ph = p[:4]
+            pc_x = px + pw / 2.0
+            pc_y = py + ph / 2.0
+            # Center offset penalty
+            dist_to_center = np.hypot(pc_x - center_x, pc_y - center_y) / (w * 0.5)
+            # Area score (closer person is larger)
+            area_ratio = (pw * ph) / float(w * h)
+            base_score = area_ratio * 3.0 - dist_to_center * 0.6
 
-            # Hysteresis bonus for tracking the same target
+            # Tracking hysteresis for same target
             if last_target is not None:
                 lx, ly, lw, lh = last_target[:4]
                 lc_x = lx + lw / 2.0
                 lc_y = ly + lh / 2.0
-                shift = np.hypot(fc_x - lc_x, fc_y - lc_y) / (w * 0.5)
-                if shift < 0.25:
+                shift = np.hypot(pc_x - lc_x, pc_y - lc_y) / (w * 0.5)
+                if shift < 0.30:
                     base_score += 1.5
 
             return base_score
 
-        return max(faces, key=score)
+        return max(persons, key=score)

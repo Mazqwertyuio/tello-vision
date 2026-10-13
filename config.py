@@ -1,6 +1,6 @@
-"""Global Configuration for Tello Vision Autopilot.
+"""Centralized Configuration for Tello Vision Autopilot.
 
-Contains centralized parameters for LiDAR, Navigation, Follower, Route Tracking, and Safety Shield.
+Depth map obstacle avoidance & Person silhouette tracking.
 """
 
 from pathlib import Path
@@ -25,46 +25,30 @@ def get_safe_path(path: Path) -> str:
 BASE_DIR = Path(__file__).resolve().parent
 CHECKPOINTS_DIR = BASE_DIR / "checkpoints"
 DA2_CHECKPOINT = CHECKPOINTS_DIR / "depth_anything_v2_vits.pth"
-YUNET_MODEL = BASE_DIR / "face_detection_yunet_2023mar.onnx"
+YOLO_MODEL_PATH = BASE_DIR / "yolov8n.pt"
 
-# Visual LiDAR settings: Thin scan line strictly in the UPPER THIRD of the frame
-LIDAR_FOV_DEG = 82.6                 # Tello camera horizontal Field of View
-LIDAR_NUM_RAYS = 90                  # Resolution of LiDAR radial sweep
-LIDAR_SCAN_LINE_Y_PCT = 33.0         # Upper third horizontal line (eye-level horizon)
-LIDAR_SCAN_LINE_HALF_THICK_PCT = 1.5 # Thin band (e.g. 31.5% - 34.5% height)
+# Depth Map Obstacle Avoidance (disparity values 0..255, where 255 = nearest)
+DEPTH_OBSTACLE_THRESH = 150      # If center depth > 150, obstacle ahead -> steer away
+DEPTH_CRITICAL_BRAKE = 195       # Point-blank obstacle -> halt immediately
+DEPTH_SCAN_Y_MAX_PCT = 70        # Cut bottom 30% of frame to completely ignore floor
 
-# Safety & Clearance thresholds (in meters)
-LIDAR_BRAKE_DIST_M = 0.85            # Critical boundary -> stop/avoid collision
-LIDAR_CAUTION_DIST_M = 1.35          # Slowdown boundary
-LIDAR_MAX_RANGE_M = 4.5              # Maximum range in meters
-MAZE_CLEAR_DIST_M = 1.20             # Threshold: if center distance > 1.20m, path is OPEN
-
-# Speeds & Maze exploration parameters
+# Flight Speeds (-100..100)
+EXPLORE_FORWARD_SPEED = 20       # Forward cruise speed when path is clear
+EXPLORE_AVOID_YAW_SPEED = 28     # Reactive turning speed to steer away from obstacles
 MANUAL_SPEED = 35
-EXPLORE_FORWARD_SPEED = 20           # Forward speed when path is clear
-MAZE_TURN_YAW_SPEED = 32             # Yaw speed for reliable ~10-15° turn pulses
-MAZE_STEP_PULSE_DURATION = 0.42      # Pulse duration to rotate ~10-15 degrees
-MAZE_CHECK_PAUSE_DURATION = 0.25     # Settle time between turn steps to scan depth
 
-# Person Follower parameters
-FOLLOW_TARGET_AREA = 0.05            # Target face area ratio in frame
-FOLLOW_SPEED_GAIN = 60               # Responsiveness
-FOLLOW_MAX_SPEED = 30
-FOLLOW_TRACK_YAW_LIMIT = 40
-FOLLOW_SEARCH_YAW_SPEED = 24
-FOLLOW_AREA_FILTER_ALPHA = 0.75
+# Person Silhouette Tracking
+PERSON_TARGET_AREA = 0.12        # Target silhouette area ratio (approx 1.5 - 2 meters distance)
+PERSON_FOLLOW_SPEED = 18         # Speed moving towards person
+PERSON_TRACK_YAW_LIMIT = 35      # Max yaw turning rate when tracking person
 
-# Altitude control (ToF sensor in cm)
-TARGET_ALTITUDE_CM = 70              # Ideal eye-level cruising height
-MIN_ALTITUDE_CM = 45                 # Too close to floor -> ascend
-MAX_ALTITUDE_CM = 110                # Too close to ceiling -> descend
+# Altitude limits (ToF sensor in cm)
+TARGET_ALTITUDE_CM = 70
+MIN_ALTITUDE_CM = 45
+MAX_ALTITUDE_CM = 110
 
-# Neural network settings
-DEPTH_INPUT_SIZE = 252               # Real-time DA2 resolution
-DEPTH_EMA_ALPHA = 0.80               # Temporal smoothing
-FACE_DETECTION_SCALE = 0.5           # Downscale factor for face detection
-FACE_CONFIDENCE_THRESH = 0.65
+# AI Models resolution
+DEPTH_INPUT_SIZE = 252
+DEPTH_EMA_ALPHA = 0.80
 
-# GUI Settings
-WINDOW_TITLE = "Tello Vision: Thin-Line LiDAR, Maze Explorer & Route Tracker"
-HUD_RADAR_SIZE = 240
+WINDOW_TITLE = "Tello Vision: Depth Obstacle Avoidance & Silhouette Following"
