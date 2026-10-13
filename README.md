@@ -1,58 +1,79 @@
-# Tello Vision & Autonomous Navigation
+# Tello Vision & Visual LiDAR Autopilot
 
-Autonomous vision-guided flight system for DJI Tello featuring:
-- **Monocular Visual LiDAR & Collision Shield** (`visual_lidar.py`): Real-time (~26 FPS) radial 90-ray obstacle scanner, eye-level flight window (floor cutoff), 3-tier proximity brake (<0.85m), and polar BEV radar.
-- **Deep Visual-Inertial SLAM (70% Sensors / 30% SLAM)** (`deep_slam.py`): Monocular dense SLAM combining DA2 depth, Lucas-Kanade optical flow, Levenberg-Marquardt PnP refinement, and IMU/odometry sensor fusion.
-- **Depth Anything V2 (DA2) Monocular Estimation**: High-speed CUDA depth prediction (~15–18 ms).
-- **2D/2.5D Room Occupancy Grid Mapping & Frontier Exploration** (`room_mapper.py`): Real-time spatial mapping of walls, tables, and free space with automatic targeting toward the deepest room opening.
-- **3D AR Perspective Path Ribbon & Radar Mini-Map** (`trajectory_planner.py`): Projected flight corridor directly on video feed.
-- **Low-altitude Table Corridor Autopilot (~30–35 cm)** with downward ToF ground distance sensing.
-- **Monochrome Wall Guard**: Texture variance and gradient analysis to prevent fly-aways near featureless walls.
-- **Semantic Doorway Detection & Traversal**: YOLO-World aperture detection validated with local depth steps.
-- **Real-Time Interactive Flight Viewer** (`live_da2_navigator.py`): Scrubbing, calibration, and live room map reconstruction.
+Модульна автономна система пілотування для **DJI Tello** на базі комп'ютерного зору та нейромережевої карти глибини **Depth Anything V2**.
 
-## Architecture & Modules
-- `visual_lidar.py`: Standalone Visual LiDAR scanner, collision shield, polar radar HUD, and safe escape gap finder.
-- `deep_slam.py`: 6-DoF Visual-Inertial SLAM, 70/30 sensor fusion, 3D voxel filtering, and flight trajectory reconstructor.
-- `flight_window_config.py` & `flight_window_config.json`: Interactive flight corridor & floor cutoff calibration.
-- `tello_connect.py`: Real-time drone control loop, autopilot state machines, and HUD.
-- `room_mapper.py`: Real-time 2D occupancy grid mapper, raycasting, and deepest clearance targeting.
-- `da2_depth.py`: Depth Anything V2 wrapper with temporal EMA flicker suppression.
-- `trajectory_planner.py`: Smooth polynomial path planner, 3D AR ribbon projection, and BEV radar.
-- `room_geometry_da2.py`: Corridor and monochrome wall evaluator.
-- `door_navigator.py`: YOLO-World doorway detector and local depth verifier.
-- `live_da2_navigator.py`: Interactive flight replay with DA2 depth and real-time room map.
-- `test_da2_flight_offline.py`: Offline evaluation benchmark and automated video generator.
+## 🎯 Ключові принципи роботи
 
-## Requirements
-```bash
-conda activate yolo_env
-pip install -r requirements.txt
+1. **Тонка лінія LiDAR у верхній третині кадру**:
+   - Сканування глибини виконується строго по **тонкій горизонтальній лінії у верхній третині зображення** (~33% висоти кадру — горизонт очей дрона).
+   - Повністю ігнорує килими, підлогу, меблеві ніжки знизу та стелю.
+   - Миттєво визначає, чи є прямо по курсу перешкода і чи відкритий проліт.
+   - Відображається прямо на HUD екрані у вигляді неонового лазерного променя (зелений = чисто, червоний = перешкода).
+
+2. **Режим 1: Прохід лабіринту / Дослідження (`MAZE / EXPLORE`)**:
+   - **Якщо проліт вільний** -> дрон летить прямо вперед.
+   - **Якщо попереду перешкода** -> дрон зупиняється на місці (рух назад строго заборонено, оскільки позаду сліпа зона!) і виконує дискретний поворот на **~10-15 градусів** у зафіксовану сторону та перевіряє лінію лідара.
+   - **Як тільки з'являється просвіт** -> дрон **миттєво відновлює політ вперед**.
+   - Жодних рухів назад наосліп та зациклених поворотів!
+
+3. **Режим 2: Слідування за людиною (`FOLLOW`)**:
+   - Пошук людини/обличчя (YuNet DNN).
+   - Центрування за курсом та висотою.
+   - Дрон наближається та слідує за людиною **ТІЛЬКИ ЯКЩО ПРОЛІТ ВІДКРИТИЙ** (лінія лідара підтверджує відсутність перешкод між дроном та ціллю). При перешкоді рух уперед блокується.
+
+4. **Окремий модуль інерційного маршруту (`route_tracker.py`)**:
+   - Розраховує одометрію методом Dead Reckoning на основі швидкостей та компасу (Yaw) Tello.
+   - Веде історію координат `(X, Y, Z, Yaw)`.
+   - Рендерить **2D міні-карту траєкторії польоту** в реальному часі на екрані.
+   - Автоматично зберігає координати маршруту у CSV-файл при виході.
+
+---
+
+## 📁 Структура проєкту
+
+```
+tello/
+│── drone/
+│   ├── __init__.py
+│   ├── drone_client.py     # Зв'язок з Tello, RC-керування, телеметрія швидкостей
+│   └── route_tracker.py    # Окремий модуль трекінгу маршруту по інерційці (2D міні-карта)
+│
+│── ai/
+│   ├── __init__.py
+│   ├── depth_model.py      # Depth Anything V2 (CUDA) з EMA фільтром
+│   └── person_detector.py  # Детекція людей (OpenCV YuNet DNN / Haar Cascade)
+│
+│── lidar/
+│   ├── __init__.py
+│   ├── visual_lidar.py     # Тонка лінія лідара у верхній третині кадру, сектори
+│   ├── spatial_memory.py   # Полярна пам'ять перешкод
+│   └── collision_shield.py # Щит безпеки та запобігання аваріям
+│
+│── modes/
+│   ├── __init__.py
+│   ├── room_explorer.py    # Режим лабіринту: політ прямо / поворот на 10° до просвіту
+│   └── person_follower.py  # Слідування за людиною з перевіркою відкритості прольоту
+│
+│── ui/
+│   ├── __init__.py
+│   └── hud_renderer.py     # Лазерна лінія на відео, кнопки, радар, 2D міні-карта треку
+│
+│── config.py               # Центральні налаштування швидкостей, кутів і порогів
+│── main.py                 # Головний контролер
+│── tello_connect.py        # Шлюз запуску
+│── start_autopilot.bat     # Батник швидкого запуску
 ```
 
-## Quick Start
-- **Visual LiDAR & Obstacle Shield (Real-Time Radar):**
-  ```bash
-  python visual_lidar.py latest
-  ```
-- **Deep Visual-Inertial SLAM & Trajectory Reconstructor:**
-  ```bash
-  python deep_slam.py latest
-  ```
-- **Real-Time Interactive Viewer & Room Map Replayer:**
-  ```bash
-  python live_da2_navigator.py latest
-  ```
-  * Or double-click `start_realtime_viewer.bat`.
-- **Run Drone Autopilot (Live Flight):**
-  ```bash
-  python tello_connect.py
-  ```
-  - Press `a`: Low-Altitude Table Corridor Autopilot (30cm)
-  - Press `e`: Room Exploration & Door Navigation (steers into deepest room clearance)
-  - Press `SPACE`: Instant hover
-  - Press `l`: Land
-- **Run Offline Benchmark & Video Export:**
-  ```bash
-  .\run_da2_test.bat --flight <flight_folder>
-  ```
+---
+
+## 🕹 Керування
+
+| Клавіша / Кнопка | Дія |
+|---|---|
+| **[T]** / `TAKEOFF` | Зліт та старт запису маршруту |
+| **[L]** / `Space` / `LAND` | Посадка |
+| **[E]** / `MAZE [E]` | **Режим 1: Прохід лабіринту (прямо / поворот на 10°)** |
+| **[F]** / `FOLLOW [F]` | **Режим 2: Слідування за людиною (при відкритому прольоті)** |
+| **[V]** або **[M]** | Перемикання віджету: Радар LiDAR / 2D Міні-карта треку / Вимкнено |
+| **W, A, S, D** | Ручний політ під захистом Collision Shield |
+| **Esc / Q** | Аварійна зупинка та збереження маршруту в CSV |

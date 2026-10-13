@@ -1,1 +1,0 @@
-frame_idx,timestamp,elapsed_s,state,phase,faces_count,face_x,face_y,face_w,face_h,face_conf,lr,fb,ud,yaw,battery,depth_left,depth_center,depth_right,depth_center_max,depth_ms,door_status,door_phase,door_passable,door_cx,door_cy,door_step
