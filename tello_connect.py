@@ -1,6 +1,7 @@
 """DJI Tello face detection, automatic approach, and manual keyboard control."""
 
 import csv
+import math
 import os
 import time
 from datetime import datetime
@@ -15,6 +16,14 @@ from door_navigator import (
     DoorwayDetector, draw_door_hud,
     analyze_forward_corridor, draw_corridor_hud
 )
+from visual_lidar import VisualLiDARScanner, render_visual_lidar_hud
+from flight_window_config import load_flight_window_config, get_pixel_bounds
+
+try:
+    from da2_depth import DA2DepthEstimator
+    HAS_DA2 = True
+except ImportError:
+    HAS_DA2 = False
 
 
 MANUAL_SPEED = 35
@@ -33,13 +42,14 @@ DEBUG_LOG_INTERVAL = 0.2
 DEBUG_SCREENSHOT_INTERVAL = 1.0
 DETECTION_INTERVAL = 0.06
 DETECTION_SCALE = 0.5
-DEPTH_INTERVAL = 0.08
+DEPTH_INTERVAL = 0.06
 DEPTH_RESOLUTION = (128, 96)
-WINDOW_NAME = "Tello Vision & Door Navigator"
+WINDOW_NAME = "Tello Vision & Visual LiDAR Autopilot"
 TAKEOFF_BUTTON = (10, 45, 125, 85)
 LAND_BUTTON = (135, 45, 245, 85)
-CORRIDOR_BUTTON = (255, 45, 430, 85)
-DOOR_BUTTON = (440, 45, 575, 85)
+LIDAR_BUTTON = (255, 45, 435, 85)
+RADAR_BUTTON = (445, 45, 595, 85)
+
 SCAN_YAW_SPEED = 20
 SCAN_ROTATION_TIME = 9.0  # Duration for full ~360 degree room survey (seconds)
 EXPLORE_BURST_TIME = 2.5  # Duration to translate into open room space (~1 meter)
@@ -223,7 +233,80 @@ def select_target_face(faces, last_face):
     return max(faces, key=match_score)
 
 
+class SpatialObstacleMemory:
+    """360-degree persistent spatial polar memory for obstacles around the drone.
+    
+    Divides the horizontal plane into 36 sectors (10 deg each in world compass frame).
+    Retains obstacle positions across time so walls/furniture that rotate
+    out of the camera FOV are remembered and used for corridor centering and route planning.
+    """
+
+    def __init__(self, num_bins=36, default_dist_m=4.5):
+        self.num_bins = num_bins
+        self.bin_size_deg = 360.0 / num_bins  # 10 deg per bin
+        self.default_dist_m = default_dist_m
+        self.distances = np.full(num_bins, default_dist_m, dtype=np.float32)
+        self.timestamps = np.zeros(num_bins, dtype=np.float64)
+
+    def reset(self):
+        self.distances.fill(self.default_dist_m)
+        self.timestamps.fill(0.0)
+
+    def update_from_scan(self, rays, current_yaw_deg, now):
+        """Update polar memory from current 90-ray LiDAR sweep."""
+        for r in rays:
+            ang_deg = r["angle_deg"]
+            dist_m = r["dist_m"]
+            world_ang = (current_yaw_deg + ang_deg) % 360.0
+            idx = int(world_ang / self.bin_size_deg) % self.num_bins
+            old_d = self.distances[idx]
+            if dist_m < old_d:
+                self.distances[idx] = 0.80 * dist_m + 0.20 * old_d
+            else:
+                self.distances[idx] = 0.35 * dist_m + 0.65 * old_d
+            self.timestamps[idx] = now
+
+    def decay(self, now):
+        """Slowly relax obstacle memory for bins not seen recently."""
+        for i in range(self.num_bins):
+            age = now - self.timestamps[i]
+            if age > 2.0:
+                self.distances[i] = min(self.default_dist_m, self.distances[i] + 0.04 * min(1.0, age - 2.0))
+
+    def get_flank_clearance(self, current_yaw_deg, relative_deg, spread_deg=25):
+        """Get minimum obstacle clearance on flank (e.g. -90 deg for left, +90 for right)."""
+        center_w = (current_yaw_deg + relative_deg) % 360.0
+        min_d = self.default_dist_m
+        for off in np.linspace(-spread_deg, spread_deg, 5):
+            w_ang = (center_w + off) % 360.0
+            idx = int(w_ang / self.bin_size_deg) % self.num_bins
+            min_d = min(min_d, float(self.distances[idx]))
+        return min_d
+
+    def find_best_open_heading(self, current_yaw_deg):
+        """Find the world heading with maximum open clearance (smoothing over 3 bins)."""
+        smoothed = np.zeros(self.num_bins, dtype=np.float32)
+        for i in range(self.num_bins):
+            prev_i = (i - 1) % self.num_bins
+            next_i = (i + 1) % self.num_bins
+            smoothed[i] = 0.25 * self.distances[prev_i] + 0.50 * self.distances[i] + 0.25 * self.distances[next_i]
+
+        # Penalize reverse direction (>135 deg) slightly to avoid unnecessary backtrack
+        for i in range(self.num_bins):
+            bin_ang = i * self.bin_size_deg
+            rel_ang = abs((bin_ang - current_yaw_deg + 180.0) % 360.0 - 180.0)
+            if rel_ang > 135.0:
+                smoothed[i] *= 0.85
+
+        best_idx = int(np.argmax(smoothed))
+        best_heading = (best_idx * self.bin_size_deg + self.bin_size_deg / 2.0) % 360.0
+        if best_heading > 180.0:
+            best_heading -= 360.0
+        return float(best_heading), float(smoothed[best_idx])
+
+
 class MonoDepthEstimator:
+
     """Lightweight Monocular Depth Estimation on CUDA/CPU (supports 96x96 and 128x96)
     with real-time temporal flicker reduction and smooth range normalization.
     """
@@ -352,10 +435,10 @@ def on_mouse(event, x, y, _flags, requested_action):
             requested_action["takeoff"] = True
         elif inside_button(x, y, LAND_BUTTON):
             requested_action["land"] = True
-        elif inside_button(x, y, CORRIDOR_BUTTON):
-            requested_action["corridor_nav"] = True
-        elif inside_button(x, y, DOOR_BUTTON):
-            requested_action["door_nav"] = True
+        elif inside_button(x, y, LIDAR_BUTTON):
+            requested_action["lidar_nav"] = True
+        elif inside_button(x, y, RADAR_BUTTON):
+            requested_action["toggle_radar"] = True
 
 
 def draw_button(frame, rect, label, enabled):
@@ -369,7 +452,11 @@ def draw_button(frame, rect, label, enabled):
 def main():
     drone = Tello()
     airborne = False
-    requested_action = {"takeoff": False, "land": False, "corridor_nav": False, "door_nav": False}
+    requested_action = {
+        "takeoff": False, "land": False,
+        "lidar_nav": False, "toggle_radar": False,
+        "corridor_nav": False, "door_nav": False
+    }
     manual_movement = 0
     last_arrow_time = 0.0
     auto_active = False
@@ -381,7 +468,50 @@ def main():
     face_hit_count = 0
     last_tracked_face = None
     detector = FaceDetector()
-    depth_estimator = MonoDepthEstimator(input_size=DEPTH_RESOLUTION)
+
+    # Visual LiDAR & Monocular Depth Engine (DA2 on CUDA with fallback)
+    lidar_nav_active = False
+    lidar_nav_phase = "CRUISE"  # "CRUISE", "SCAN_360", "ALIGN_BEST", "REVERSE_STEP"
+    radar_view_active = True
+    total_distance_traveled_m = 0.0
+    last_state_at = time.monotonic()
+    current_speed_mps = 0.0
+    latest_scan_res = None
+    target_heading_deg = None
+    polar_memory = SpatialObstacleMemory(num_bins=36, default_dist_m=4.5)
+    scan_360_start_yaw = 0.0
+    scan_360_last_yaw = 0.0
+    scan_360_accum_yaw = 0.0
+    scan_360_start_time = 0.0
+    scan_best_heading = 0.0
+    scan_best_clearance = 0.0
+    reverse_step_start_time = 0.0
+    d_left = 4.0
+    d_right = 4.0
+    window_cfg = load_flight_window_config()
+
+
+    lidar_scanner = VisualLiDARScanner(
+        num_rays=90,
+        brake_dist_m=0.85,
+        caution_dist_m=1.45,
+        depth_scale_factor=3.8,
+        corridor_half_width_m=0.25,
+    )
+
+    depth_estimator = None
+    if HAS_DA2:
+        try:
+            print("Loading Depth Anything V2 (DA2) on CUDA for Visual LiDAR...")
+            depth_estimator = DA2DepthEstimator(input_size=252)
+            print("Depth Anything V2 loaded successfully!")
+        except Exception as exc:
+            print(f"Failed to initialize DA2 ({exc}), using MonoDepthEstimator fallback.")
+            depth_estimator = None
+
+    if depth_estimator is None:
+        depth_estimator = MonoDepthEstimator(input_size=DEPTH_RESOLUTION)
+
     door_detector = DoorwayDetector(depth_estimator=depth_estimator, use_yolo=True)
     door_nav_active = False
     door_phase = "IDLE"  # IDLE, SCAN_ROOM, EXPLORE_MOVE, VERIFY, ALIGN, APPROACH, TRAVERSE, CLEARED
@@ -415,11 +545,18 @@ def main():
     debug_dir.mkdir(parents=True, exist_ok=True)
     command_log_file = (debug_dir / "flight_telemetry.csv").open("w", newline="", encoding="utf-8")
     command_log = csv.writer(command_log_file)
-    command_log.writerow(("frame_idx", "timestamp", "elapsed_s", "state", "phase", "faces_count",
-                          "face_x", "face_y", "face_w", "face_h", "face_conf", "lr", "fb", "ud", "yaw", "battery",
-                          "depth_left", "depth_center", "depth_right", "depth_center_max", "depth_ms",
-                          "door_status", "door_phase", "door_passable", "door_cx", "door_cy", "door_step",
-                          "imu_pitch", "imu_roll", "imu_yaw", "speed_vx", "speed_vy", "speed_vz", "tof_cm", "baro_cm"))
+    command_log.writerow((
+        "frame_idx", "timestamp", "elapsed_s", "state", "shield_state",
+        "lr", "fb", "ud", "yaw", "battery",
+        "imu_pitch", "imu_roll", "imu_yaw",
+        "accel_x", "accel_y", "accel_z",
+        "speed_vx", "speed_vy", "speed_vz", "speed_mps",
+        "tof_cm", "baro_cm", "distance_traveled_m",
+        "lidar_closest_m", "lidar_closest_deg",
+        "lidar_center_m", "lidar_left_m", "lidar_right_m",
+        "lidar_rec_heading_deg", "lidar_action", "depth_ms"
+    ))
+
     legacy_log_file = (debug_dir / "commands.csv").open("w", newline="", encoding="utf-8")
     legacy_log = csv.writer(legacy_log_file)
     legacy_log.writerow(("timestamp", "elapsed_s", "phase", "faces", "face_x", "face_y",
@@ -457,16 +594,17 @@ def main():
         print(f"Connected. Battery: {battery_level}%")
         drone.streamon()
         frame_read = drone.get_frame_read()
-        cv2.namedWindow(WINDOW_NAME)
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(WINDOW_NAME, on_mouse, requested_action)
         print("Controls:")
-        print("  a / Button     - Low-Altitude (30cm) Table Corridor Autopilot (between tables)")
-        print("  e              - Doorway Navigation Autopilot")
+        print("  v / Button     - Visual LiDAR Free-Route Autopilot (autonomous obstacle avoidance)")
+        print("  m / Button     - Toggle Dual-Panel Radar Map view (local live sweep)")
         print("  t / l          - Takeoff / Land")
-        print("  f              - Legacy Face Follow mode")
-        print("  n              - Toggle HUD overlay")
-        print("  r              - Record clean DA3 clip")
         print("  SPACE          - Emergency Stop / Manual Hover")
+        print("  a              - Table Corridor Autopilot (legacy)")
+        print("  e              - Doorway Navigation Autopilot (legacy)")
+        print("  f              - Face Follow mode (legacy)")
+        print("  r              - Record clean DA3 clip")
         print("  q              - Quit")
         print(f"Recording video, depth maps, and telemetry to: {debug_dir}")
 
@@ -514,19 +652,27 @@ def main():
             if is_manual_recording and manual_rec_writer is not None:
                 manual_rec_writer.write(raw_frame)
 
-            # Depth estimation, corridor analysis and room/doorway analysis
+            # Depth estimation and Visual LiDAR radial obstacle scanning
             if now - last_depth_at >= DEPTH_INTERVAL:
                 try:
                     (latest_depth_map, latest_depth_colormap,
                      latest_sectors, latest_center_max, depth_ms) = depth_estimator.predict(frame)
+                    # 90-ray radial sweep using flight window calibration (ignoring floor/ceiling)
+                    latest_scan_res = lidar_scanner.scan(
+                        latest_depth_map,
+                        window_cfg=window_cfg,
+                        forward_speed_mps=current_speed_mps
+                    )
                     latest_corridor_info = analyze_forward_corridor(latest_depth_map, frame_bgr=frame)
                     latest_door_info = door_detector.analyze(frame, latest_depth_map)
                 except Exception as exc:
                     pass
                 last_depth_at = now
 
-            # Query Tello onboard state sensors (IMU Gyro, ToF, Optical Flow velocities)
+            # Query Tello onboard state sensors (IMU Gyro, Accelerometer, ToF, Optical Flow velocities)
             if now - last_tof_at >= 0.05:
+                dt_state = max(0.001, min(0.3, now - last_state_at))
+                last_state_at = now
                 try:
                     current_tello_state = drone.get_current_state() or {}
                     tof_val = current_tello_state.get("tof")
@@ -536,9 +682,18 @@ def main():
                         tof_val = drone.get_distance_tof()
                         if tof_val and 5 < tof_val < 300:
                             current_tof = tof_val
+
+                    # Odometry integration from optical flow velocities (vgx, vgy, vgz in dm/s -> m/s)
+                    vx = float(current_tello_state.get("vgx", 0) or 0) * 0.1
+                    vy = float(current_tello_state.get("vgy", 0) or 0) * 0.1
+                    vz = float(current_tello_state.get("vgz", 0) or 0) * 0.1
+                    current_speed_mps = math.sqrt(vx * vx + vy * vy + vz * vz)
+                    if airborne:
+                        total_distance_traveled_m += current_speed_mps * dt_state
                 except Exception:
                     pass
                 last_tof_at = now
+
 
             # Record synchronized depth colormap frame to depth video
             if depth_video_writer is not None:
@@ -673,8 +828,166 @@ def main():
                     auto_phase = "IDLE"
                     manual_movement = 0
 
+            # Visual LiDAR Autonomous Free-Route Navigation (360° Survey, Spatial Memory & Equidistant Centering)
+            if lidar_nav_active and airborne:
+                curr_yaw = float(current_tello_state.get("yaw", 0) or 0)
+                if target_heading_deg is None:
+                    target_heading_deg = curr_yaw
+
+                # Update 360° polar obstacle memory each frame
+                if latest_scan_res is not None:
+                    polar_memory.update_from_scan(latest_scan_res["rays"], curr_yaw, now)
+                polar_memory.decay(now)
+
+                # Height maintenance via downward ToF sensor (~60-80cm flight altitude)
+                tof_h = current_tof if current_tof is not None else 65
+                if tof_h < 45:
+                    ud = 18    # lift up away from carpet/floor
+                elif tof_h > 105:
+                    ud = -14   # gently bring down if drifting too high
+                else:
+                    ud = 0
+
+                c_min = latest_scan_res["sectors"]["center"]["min_m"] if latest_scan_res else 4.0
+                l_min = latest_scan_res["sectors"]["left"]["min_m"] if latest_scan_res else 4.0
+                r_min = latest_scan_res["sectors"]["right"]["min_m"] if latest_scan_res else 4.0
+                closest_m = latest_scan_res["closest"]["dist_m"] if latest_scan_res else 4.0
+
+                # Memory-backed flank clearances (retaining obstacles even outside camera FOV)
+                mem_left_m = polar_memory.get_flank_clearance(curr_yaw, -90.0, spread_deg=30)
+                mem_right_m = polar_memory.get_flank_clearance(curr_yaw, +90.0, spread_deg=30)
+                d_left = min(l_min, mem_left_m)
+                d_right = min(r_min, mem_right_m)
+
+                # -------------------------------------------------------------
+                # PHASE 1: REVERSE_STEP (Brief step back if critically close to frontal barrier)
+                # -------------------------------------------------------------
+                if lidar_nav_phase == "REVERSE_STEP":
+                    if now - reverse_step_start_time < 0.9:
+                        rc_command = (0, -12, ud, 0)
+                    else:
+                        # Step back done, initiate 360 survey scan!
+                        lidar_nav_phase = "SCAN_360"
+                        scan_360_start_yaw = curr_yaw
+                        scan_360_last_yaw = curr_yaw
+                        scan_360_accum_yaw = 0.0
+                        scan_360_start_time = now
+                        print("\n[LIDAR 360 SCAN] Obstacle ahead -> Starting full 360° survey on the spot...")
+                        try:
+                            winsound.Beep(1100, 120)
+                        except Exception:
+                            pass
+                        rc_command = (0, 0, ud, 26)
+
+                # -------------------------------------------------------------
+                # PHASE 2: SCAN_360 (Full 360-degree rotation to evaluate room)
+                # -------------------------------------------------------------
+                elif lidar_nav_phase == "SCAN_360":
+                    # Rotate smoothly on the spot at yaw rate +26
+                    d_yaw = abs((curr_yaw - scan_360_last_yaw + 180.0) % 360.0 - 180.0)
+                    scan_360_accum_yaw += d_yaw
+                    scan_360_last_yaw = curr_yaw
+
+                    rc_command = (0, 0, ud, 26)
+
+                    # Finished 360 degree circle
+                    scan_duration = now - scan_360_start_time
+                    if scan_360_accum_yaw >= 345.0 or scan_duration >= 8.5:
+                        best_heading, best_dist = polar_memory.find_best_open_heading(curr_yaw)
+                        scan_best_heading = best_heading
+                        scan_best_clearance = best_dist
+                        target_heading_deg = best_heading
+                        lidar_nav_phase = "ALIGN_BEST"
+                        print(f"\n[LIDAR 360 SCAN] 360° survey complete! Found clearest route: heading {best_heading:+.0f}° ({best_dist:.2f}m clearance). Aligning...")
+                        try:
+                            winsound.Beep(1400, 150)
+                        except Exception:
+                            pass
+                        rc_command = (0, 0, ud, 0)
+
+                # -------------------------------------------------------------
+                # PHASE 3: ALIGN_BEST (Turn to face winning clear direction)
+                # -------------------------------------------------------------
+                elif lidar_nav_phase == "ALIGN_BEST":
+                    yaw_err = (scan_best_heading - curr_yaw + 180.0) % 360.0 - 180.0
+                    yaw_steer = int(clamp(yaw_err * 0.85, -24, 24))
+                    if abs(yaw_steer) < 8 and abs(yaw_err) > 2.0:
+                        yaw_steer = 8 if yaw_steer > 0 else -8
+
+                    if abs(yaw_err) <= 4.0:
+                        # Aligned on open vector! Lock heading and resume straight flight
+                        target_heading_deg = curr_yaw
+                        lidar_nav_phase = "CRUISE"
+                        print(f"\n[LIDAR ALIGN] Locked on clear vector ({curr_yaw:+.0f}°)! Resuming straight flight.")
+                        try:
+                            winsound.Beep(1800, 200)
+                        except Exception:
+                            pass
+                        rc_command = (0, 0, ud, 0)
+                    else:
+                        rc_command = (0, 0, ud, yaw_steer)
+
+                # -------------------------------------------------------------
+                # PHASE 4: CRUISE (Maximum straight-line flight & equidistant centering)
+                # -------------------------------------------------------------
+                else:  # "CRUISE"
+                    # Obstacle check ahead:
+                    if c_min < 0.85 or closest_m < 0.70:
+                        # Dead-end or frontal obstacle encountered!
+                        # Don't just sit and stare -> trigger 360 survey scan!
+                        if closest_m < 0.60:
+                            lidar_nav_phase = "REVERSE_STEP"
+                            reverse_step_start_time = now
+                            rc_command = (0, -12, ud, 0)
+                        else:
+                            lidar_nav_phase = "SCAN_360"
+                            scan_360_start_yaw = curr_yaw
+                            scan_360_last_yaw = curr_yaw
+                            scan_360_accum_yaw = 0.0
+                            scan_360_start_time = now
+                            print(f"\n[LIDAR 360 SCAN] Frontal barrier detected (c_min={c_min:.2f}m) -> Starting 360° survey scan...")
+                            try:
+                                winsound.Beep(1100, 120)
+                            except Exception:
+                                pass
+                            rc_command = (0, 0, ud, 26)
+                    else:
+                        # Forward route is passable! Keep flight STRICTLY STRAIGHT along locked heading
+                        yaw_err = (target_heading_deg - curr_yaw + 180.0) % 360.0 - 180.0
+                        yaw_hold = int(clamp(yaw_err * 0.45, -7, 7)) if abs(yaw_err) > 2.0 else 0
+
+                        # Forward speed: fast when clear, gentle crawl when caution
+                        if c_min > 1.35:
+                            fwd = 20
+                        else:
+                            fwd = 10
+
+                        # EQUIDISTANT CENTERING BETWEEN OBSTACLES:
+                        # When obstacles/tables are present on both flanks, fly equidistantly between them
+                        lateral = 0
+                        if d_left < 2.0 and d_right < 2.0:
+                            # Both sides bounded -> compute distance difference
+                            diff_m = d_right - d_left  # positive means left is closer, negative means right is closer
+                            if abs(diff_m) > 0.08:     # deadband of 8 cm
+                                lateral = int(clamp(diff_m * 18.0, -16, 16))
+                        elif d_left < 0.90:
+                            # Too close to left obstacle only -> strafe right
+                            lateral = 14
+                        elif d_right < 0.90:
+                            # Too close to right obstacle only -> strafe left
+                            lateral = -14
+                        elif latest_scan_res:
+                            # Subtle centering bias towards recommended gap
+                            rec_heading = latest_scan_res["recommended_heading_deg"]
+                            lateral = int(clamp(rec_heading * 0.40, -10, 10))
+
+                        rc_command = (lateral, fwd, ud, yaw_hold)
+
+
+
             # Low-Altitude Forward Corridor Navigation between Tables (~30-35cm)
             if corridor_nav_active and airborne:
+
                 ci = latest_corridor_info or {}
 
                 # 1. Active Altitude Control Loop: target 30-35 cm above floor
@@ -927,7 +1240,7 @@ def main():
                         door_nav_active = False
                         door_phase = "IDLE"
 
-            if airborne and not auto_active and not door_nav_active and not corridor_nav_active:
+            if airborne and not auto_active and not door_nav_active and not corridor_nav_active and not lidar_nav_active:
                 if manual_movement and now - last_arrow_time > KEY_TIMEOUT:
                     manual_movement = 0
                 rc_command = (0, manual_movement * MANUAL_SPEED, 0, 0)
@@ -935,7 +1248,18 @@ def main():
                 drone.send_rc_control(*rc_command)
 
             state = "AIRBORNE" if airborne else "LANDED"
-            if corridor_nav_active:
+            if lidar_nav_active:
+                sh_st = latest_scan_res.get("shield_state", "CLEAR") if latest_scan_res else "INIT"
+                dist_txt = f"{total_distance_traveled_m:.2f}m"
+                if lidar_nav_phase == "SCAN_360":
+                    state += f" | LIDAR 360 SCAN ({scan_360_accum_yaw:.0f}deg/360) [Dist={dist_txt}]"
+                elif lidar_nav_phase == "ALIGN_BEST":
+                    state += f" | LIDAR ALIGN -> {scan_best_heading:+.0f}deg [Dist={dist_txt}]"
+                elif lidar_nav_phase == "REVERSE_STEP":
+                    state += f" | LIDAR BACKSTEP [Dist={dist_txt}]"
+                else:
+                    state += f" | LIDAR CRUISE ({sh_st}) [L={d_left:.1f}m R={d_right:.1f}m] [Dist={dist_txt}]"
+            elif corridor_nav_active:
                 c_st = latest_corridor_info.get("state", "HOLD") if latest_corridor_info else "INIT"
                 tof_str = f"{current_tof}cm" if current_tof is not None else "??"
                 state += f" | CORRIDOR 30cm: {c_st} [ToF={tof_str}]"
@@ -946,11 +1270,11 @@ def main():
             else:
                 state += " | MANUAL"
 
-            # Draw Navigation HUD overlays
-            if corridor_nav_active or (corridor_overlay_enabled and not door_nav_active):
+            # Draw Navigation HUD overlays (when in legacy corridor/door mode)
+            if corridor_nav_active or (corridor_overlay_enabled and not door_nav_active and not lidar_nav_active):
                 if latest_corridor_info is not None:
                     draw_corridor_hud(frame, latest_corridor_info, current_tof, CORRIDOR_TARGET_HEIGHT)
-            elif door_overlay_enabled and latest_door_info is not None:
+            elif door_overlay_enabled and latest_door_info is not None and not lidar_nav_active:
                 draw_door_hud(frame, latest_door_info, DEPTH_RESOLUTION)
 
             cv2.putText(frame, state, (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
@@ -959,10 +1283,10 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
             cv2.putText(frame, f"Detection: {detection_ms:.0f} ms / {DETECTION_INTERVAL:.2f}s",
                         (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-            cv2.putText(frame, f"Detector: {detector.name}", (width - 240, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
-            cv2.putText(frame, f"BAT: {battery_level}%", (width - 240, 48),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0) if battery_level > 20 else (0, 0, 255), 1)
+            cv2.putText(frame, f"BAT: {battery_level}%", (width - 150, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0) if battery_level > 20 else (0, 0, 255), 1)
+            cv2.putText(frame, f"Dist: {total_distance_traveled_m:.2f}m", (width - 150, 48),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 220, 255), 1)
             rec_blink = int(now * 2) % 2 == 0
             rec_color = (0, 0, 255) if rec_blink else (0, 0, 150)
             cv2.circle(frame, (width - 150, 70), 5, rec_color, -1)
@@ -980,55 +1304,54 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 180, 180), 1)
 
             # Log frame-accurate telemetry matching raw video frame_idx
-            d_l, d_c, d_r = latest_sectors
-            target_box = face[:4] if face is not None else ("", "", "", "")
-            target_conf = f"{face[4]:.2f}" if face is not None and len(face) > 4 else ""
-            door_st = latest_door_info.get("status", "NONE") if latest_door_info else "NONE"
-            door_pass = latest_door_info.get("passable", False) if latest_door_info else False
-            door_cx = round(latest_door_info.get("center_x_norm", 0.0), 3) if latest_door_info else 0.0
-            door_cy = round(latest_door_info.get("center_y_norm", 0.0), 3) if latest_door_info else 0.0
-            door_st_diff = round(latest_door_info.get("depth_step", 0.0), 1) if latest_door_info else 0.0
+            sh_st = latest_scan_res.get("shield_state", "NONE") if latest_scan_res else "NONE"
+            closest_m = round(latest_scan_res["closest"]["dist_m"], 2) if latest_scan_res else 0.0
+            closest_deg = round(latest_scan_res["closest"]["angle_deg"], 1) if latest_scan_res else 0.0
+            sec_l = round(latest_scan_res["sectors"]["left"]["min_m"], 2) if latest_scan_res else 0.0
+            sec_c = round(latest_scan_res["sectors"]["center"]["min_m"], 2) if latest_scan_res else 0.0
+            sec_r = round(latest_scan_res["sectors"]["right"]["min_m"], 2) if latest_scan_res else 0.0
+            rec_deg = round(latest_scan_res["recommended_heading_deg"], 1) if latest_scan_res else 0.0
+            rec_act = latest_scan_res.get("recommended_action", "NONE") if latest_scan_res else "NONE"
 
             command_log.writerow((
                 frame_idx,
                 datetime.now().isoformat(timespec="milliseconds"),
                 round(now - (flight_started_at or now), 3),
                 state,
-                auto_phase if auto_active else door_phase,
-                len(faces),
-                *target_box,
-                target_conf,
+                sh_st,
                 *rc_command,
                 battery_level,
-                round(d_l, 1),
-                round(d_c, 1),
-                round(d_r, 1),
-                round(latest_center_max, 1),
-                round(depth_ms, 1),
-                door_st,
-                door_phase,
-                door_pass,
-                door_cx,
-                door_cy,
-                door_st_diff,
                 current_tello_state.get("pitch", 0),
                 current_tello_state.get("roll", 0),
                 current_tello_state.get("yaw", 0),
+                current_tello_state.get("agx", 0),
+                current_tello_state.get("agy", 0),
+                current_tello_state.get("agz", 0),
                 current_tello_state.get("vgx", 0),
                 current_tello_state.get("vgy", 0),
                 current_tello_state.get("vgz", 0),
+                round(current_speed_mps, 2),
                 current_tello_state.get("tof", current_tof or 0),
                 round(float(current_tello_state.get("baro", 0.0) or 0.0), 1),
+                round(total_distance_traveled_m, 2),
+                closest_m,
+                closest_deg,
+                sec_c,
+                sec_l,
+                sec_r,
+                rec_deg,
+                rec_act,
+                round(depth_ms, 1),
             ))
             command_log_file.flush()
 
             if airborne and now - last_debug_log_at >= DEBUG_LOG_INTERVAL:
                 legacy_log.writerow((
                     datetime.now().isoformat(timespec="milliseconds"),
-                    round(now - (auto_started_at or now), 3), auto_phase, len(faces),
+                    round(now - (auto_started_at or now), 3), state, len(faces),
                     *face_bbox, round(area, 6),
                     round(filtered_face_area or 0.0, 6), *rc_command,
-                    round(d_l, 1), round(d_c, 1), round(d_r, 1),
+                    round(sec_l, 1), round(sec_c, 1), round(sec_r, 1),
                 ))
                 legacy_log_file.flush()
                 last_debug_log_at = now
@@ -1039,37 +1362,40 @@ def main():
                     screenshot_path.write_bytes(encoded_frame.tobytes())
                 last_screenshot_at = now
 
-            # Render Depth Picture-in-Picture (PiP) and Central Corridor
-            if latest_depth_colormap is not None:
-                pip_w, pip_h = 200, 150
-                pip_x = width - pip_w - 15
-                pip_y = height - pip_h - 15
-
-                pip_img = cv2.resize(latest_depth_colormap, (pip_w, pip_h), interpolation=cv2.INTER_LINEAR)
-                psw = pip_w // 3
-                cv2.line(pip_img, (psw, 0), (psw, pip_h), (80, 80, 80), 1)
-                cv2.line(pip_img, (2 * psw, 0), (2 * psw, pip_h), (80, 80, 80), 1)
-
-                c_color = (0, 0, 255) if d_c >= 180 else ((0, 200, 255) if d_c >= 140 else (0, 255, 0))
-                # Highlight center flight corridor (most accurate depth zone)
-                cv2.rectangle(pip_img, (psw + 2, 2), (2 * psw - 2, pip_h - 2), c_color, 2)
-                cv2.rectangle(pip_img, (0, 0), (pip_w - 1, pip_h - 1), (255, 255, 255), 1)
-                cv2.putText(pip_img, "DEPTH (CENTER)", (8, 16),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1)
-                cv2.putText(pip_img, f"C:{d_c:.0f}", (psw + 10, pip_h - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, c_color, 2)
-
-                frame[pip_y:pip_y + pip_h, pip_x:pip_x + pip_w] = pip_img
-
-                depth_hud = f"Depth L/C/R: {d_l:.0f} / {d_c:.0f} / {d_r:.0f} (max={latest_center_max:.0f}) | {depth_ms:.0f}ms [DEPTH ACTIVE]"
-                cv2.putText(frame, depth_hud, (10, height - 15),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 255, 255), 1)
-
+            # Buttons rendering on left camera panel
             draw_button(frame, TAKEOFF_BUTTON, "Takeoff (t)", not airborne)
             draw_button(frame, LAND_BUTTON, "Land (l)", airborne)
-            draw_button(frame, CORRIDOR_BUTTON, "Corridor 30cm (a)", corridor_nav_active)
-            draw_button(frame, DOOR_BUTTON, "Door Nav (e)", door_nav_active)
-            cv2.imshow(WINDOW_NAME, frame)
+            draw_button(frame, LIDAR_BUTTON, "LiDAR Nav (v)", lidar_nav_active)
+            draw_button(frame, RADAR_BUTTON, "Radar Map (m)", radar_view_active)
+
+            # Display: Dual-Panel Camera + Live Polar Visual LiDAR Map
+            if radar_view_active and latest_scan_res is not None and latest_depth_map is not None:
+                telem_dict = {
+                    "state": state,
+                    "fb": rc_command[1],
+                    "yaw": rc_command[3],
+                    "pitch": current_tello_state.get("pitch", 0),
+                    "roll": current_tello_state.get("roll", 0),
+                    "yaw_imu": current_tello_state.get("yaw", 0),
+                    "agx": current_tello_state.get("agx", 0),
+                    "agy": current_tello_state.get("agy", 0),
+                    "agz": current_tello_state.get("agz", 0),
+                    "vgx": current_tello_state.get("vgx", 0),
+                    "vgy": current_tello_state.get("vgy", 0),
+                    "vgz": current_tello_state.get("vgz", 0),
+                    "speed_mps": current_speed_mps,
+                    "tof": current_tello_state.get("tof", current_tof or 0),
+                    "dist_m": round(total_distance_traveled_m, 2),
+                }
+                display_frame = render_visual_lidar_hud(
+                    frame, latest_depth_map, latest_scan_res,
+                    frame_idx=frame_idx, total_frames=0,
+                    telem_row=telem_dict, infer_ms=depth_ms
+                )
+            else:
+                display_frame = frame
+
+            cv2.imshow(WINDOW_NAME, display_frame)
 
             key = cv2.waitKeyEx(1)
             if key == ord("q"):
@@ -1098,9 +1424,12 @@ def main():
                         pass
             takeoff_requested = requested_action["takeoff"] or key == ord("t")
             land_requested = requested_action["land"] or key == ord("l")
-            corridor_nav_requested = requested_action["corridor_nav"] or key in (ord("a"), ord("A"))
-            door_nav_requested = requested_action["door_nav"] or key in (ord("e"), ord("E"))
+            lidar_nav_requested = requested_action.get("lidar_nav", False) or key in (ord("v"), ord("V"))
+            radar_toggle_requested = requested_action.get("toggle_radar", False) or key in (ord("m"), ord("M"))
+            corridor_nav_requested = requested_action.get("corridor_nav", False) or key in (ord("a"), ord("A"))
+            door_nav_requested = requested_action.get("door_nav", False) or key in (ord("e"), ord("E"))
             requested_action["takeoff"] = requested_action["land"] = False
+            requested_action["lidar_nav"] = requested_action["toggle_radar"] = False
             requested_action["corridor_nav"] = requested_action["door_nav"] = False
 
             if takeoff_requested and not airborne:
@@ -1116,7 +1445,38 @@ def main():
                 door_nav_active = False
                 door_phase = "IDLE"
                 corridor_nav_active = False
+                lidar_nav_active = False
                 manual_movement = 0
+            elif lidar_nav_requested:
+                if not airborne:
+                    print("Taking off for Visual LiDAR Free Route Autopilot...")
+                    drone.takeoff()
+                    airborne = True
+                    time.sleep(0.5)
+                auto_active = False
+                corridor_nav_active = False
+                door_nav_active = False
+                door_phase = "IDLE"
+                lidar_nav_active = not lidar_nav_active
+                if lidar_nav_active:
+                    lidar_nav_phase = "CRUISE"
+                    polar_memory.reset()
+                    scan_360_accum_yaw = 0.0
+                    target_heading_deg = float(current_tello_state.get("yaw", 0) or 0)
+                    try:
+                        winsound.Beep(1400, 150)
+                    except Exception:
+                        pass
+                    print(f"\n[LIDAR NAV] Visual LiDAR Free-Route Autopilot ACTIVATED! Heading locked at {target_heading_deg:.1f} deg (360 survey + straight flight + equidistant centering).")
+                else:
+                    lidar_nav_phase = "CRUISE"
+                    target_heading_deg = None
+                    drone.send_rc_control(0, 0, 0, 0)
+                    print("\n[LIDAR NAV] Deactivated. Hovering in manual control.")
+
+            elif radar_toggle_requested:
+                radar_view_active = not radar_view_active
+                print(f"\n[RADAR VIEW] Radar Map View: {'DUAL-PANEL ACTIVE' if radar_view_active else 'CAMERA ONLY'}")
             elif corridor_nav_requested:
                 if not airborne:
                     print("Taking off for Table Corridor Navigation (~30-35cm)...")
@@ -1125,6 +1485,7 @@ def main():
                     time.sleep(0.5)
                 auto_active = False
                 door_nav_active = False
+                lidar_nav_active = False
                 door_phase = "IDLE"
                 corridor_nav_active = not corridor_nav_active
                 if corridor_nav_active:
@@ -1144,6 +1505,7 @@ def main():
                     time.sleep(0.5)
                 auto_active = False
                 corridor_nav_active = False
+                lidar_nav_active = False
                 door_nav_active = not door_nav_active
                 if door_nav_active:
                     door_phase = "SCAN_ROOM"
@@ -1167,6 +1529,7 @@ def main():
                     time.sleep(0.5)
                 door_nav_active = False
                 corridor_nav_active = False
+                lidar_nav_active = False
                 door_phase = "IDLE"
                 auto_active = not auto_active
                 if auto_active:
@@ -1188,13 +1551,17 @@ def main():
                 last_arrow_time = time.monotonic()
                 door_nav_active = False
                 corridor_nav_active = False
+                lidar_nav_active = False
                 auto_active = False
+                target_heading_deg = None
             elif key in DOWN_KEYS and airborne:
                 manual_movement = -1
                 last_arrow_time = time.monotonic()
                 door_nav_active = False
                 corridor_nav_active = False
+                lidar_nav_active = False
                 auto_active = False
+                target_heading_deg = None
             elif key in (ord("c"), ord("C")):
                 corridor_overlay_enabled = not corridor_overlay_enabled
                 print(f"Corridor HUD overlay: {'ENABLED' if corridor_overlay_enabled else 'DISABLED'}")
@@ -1208,7 +1575,12 @@ def main():
                 door_nav_active = False
                 door_phase = "IDLE"
                 corridor_nav_active = False
+                lidar_nav_active = False
+                target_heading_deg = None
                 drone.send_rc_control(0, 0, 0, 0)
+                print("\n[HOVER] Emergency stop / manual hover engaged.")
+
+
 
     except KeyboardInterrupt:
         print("Stopped by user.")

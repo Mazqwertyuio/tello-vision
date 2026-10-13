@@ -463,6 +463,21 @@ def render_visual_lidar_hud(frame_bgr, norm_depth_uint8, scan_res, frame_idx=0, 
     cv2.circle(vis_radar, (leg_x, 48), 4, (0, 255, 100), -1)
     cv2.putText(vis_radar, "> 1.45m (Clear)", (leg_x + 12, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
 
+    # 9. Bottom Telemetry Banner on Radar (IMU, Accel, Velocities, Odometry)
+    if telem_row:
+        cv2.rectangle(vis_radar, (0, rh - 36), (rw, rh), (16, 20, 26), -1)
+        d_trav = telem_row.get("dist_m", 0.0)
+        p_val = telem_row.get("pitch", 0)
+        r_val = telem_row.get("roll", 0)
+        y_val = telem_row.get("yaw_imu", telem_row.get("yaw", 0))
+        tof_val = telem_row.get("tof", 0)
+        ax = telem_row.get("agx", 0)
+        ay = telem_row.get("agy", 0)
+        az = telem_row.get("agz", 0)
+        spd_val = telem_row.get("speed_mps", 0.0)
+        t_line = f"DIST: {d_trav:.2f}m | SPD: {spd_val:.2f}m/s | ToF: {tof_val}cm | IMU: P:{p_val} R:{r_val} Y:{y_val} | ACC: [{ax},{ay},{az}]"
+        cv2.putText(vis_radar, t_line, (15, rh - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 215, 240), 1)
+
     # Combine Left and Right panels
     combined = np.hstack([vis_cam, vis_radar])
     cv2.line(combined, (fw, 0), (fw, fh), (60, 70, 85), 2)
