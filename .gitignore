@@ -4,23 +4,26 @@ __pycache__/
 *$py.class
 .pytest_cache/
 
-# Large files over 100MB (GitHub blocks files > 100MB)
+# Large model weights & binary checkpoints
+checkpoints/
 weights/
 *.pth
+*.pt
+*.onnx
 *.safetensors
 *.bin
+
+# Video, datasets, flights and logs
+debug/
+flights/
+*.mp4
+*.avi
+*.csv
 
 # Local scratch & temporary test images
 scratch/
 test_*.jpg
 door_verify_grid.jpg
-
-# Generated output videos & reconstructions
-debug/*/*_reconstruction.mp4
-debug/*/*_output.mp4
-debug/*/*_eval.mp4
-debug/*/*_summary.json
-debug/*/*_trajectory.csv
 
 # IDE & OS
 .vscode/
